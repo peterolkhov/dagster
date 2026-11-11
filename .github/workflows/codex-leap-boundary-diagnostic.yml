@@ -1,0 +1,116 @@
+name: Codex leap-boundary BEFORE diagnostic
+on:
+  push:
+    branches: [codex/diagnose-leap-boundary]
+permissions:
+  contents: read
+jobs:
+  reproduce-before:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      PIP_NO_CACHE_DIR: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: dagster-io/dagster
+          ref: 93e5f51da49420d3e06d9399471070acedb554ca
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.13"
+      - name: Install complete pinned source packages
+        run: python -m pip install --report /tmp/diagnostic-install-report.json -e ./python_modules/dagster-pipes -e ./python_modules/libraries/dagster-shared -e ./python_modules/dagster
+      - name: Reproduce known failures and verify controls
+        run: |
+          python - <<'PY'
+          import importlib.metadata as md
+          import json, platform, subprocess, sys
+          from datetime import datetime
+          from itertools import islice
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+          import dagster, dagster_shared, dagster_pipes
+          from dagster import Definitions, ScheduleDefinition, TimeWindowPartitionsDefinition, job, op
+          from dagster._core.remote_origin import RegisteredCodeLocationOrigin
+          from dagster._core.remote_representation.external import RemoteSchedule
+          from dagster._core.remote_representation.external_data import ScheduleSnap
+          from dagster._core.remote_representation.handle import RepositoryHandle
+          
+          PIN = "93e5f51da49420d3e06d9399471070acedb554ca"
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+          assert git("rev-parse", "HEAD") == PIN
+          assert git("diff", "--name-only") == ""
+          root = Path.cwd().resolve()
+          paths = {m.__name__: str(Path(m.__file__).resolve()) for m in (dagster, dagster_shared, dagster_pipes)}
+          assert all(root in Path(p).parents for p in paths.values())
+          
+          @op
+          def diagnostic_input():
+              return 1
+          
+          @job
+          def diagnostic_job():
+              diagnostic_input()
+          
+          def schedule(cron, tz):
+              definition = ScheduleDefinition(job=diagnostic_job, cron_schedule=cron, execution_timezone=tz)
+              repository = Definitions(jobs=[diagnostic_job], schedules=[definition]).get_repository_def()
+              handle = RepositoryHandle(repository_name=repository.name, code_location_origin=RegisteredCodeLocationOrigin("diagnostic_only"), repository_python_origin=None, display_metadata={})
+              return RemoteSchedule(ScheduleSnap.from_def(definition, repository), handle)
+          
+          rows = []
+          def record(surface, label, tz, actual, correct, before):
+              def norm(values):
+                  return [v.isoformat() if isinstance(v, datetime) else v for v in values]
+              actual, correct, before = map(norm, (actual, correct, before))
+              rows.append(dict(surface=surface, label=label, timezone=tz, actual=actual, correct_contract=correct, expected_before=before, known_bug_case=before != correct, baseline_expectation_met=actual == before, product_contract_met=actual == correct))
+          
+          for tz in ("UTC", "Europe/Berlin"):
+              zone = ZoneInfo(tz)
+              def dt(y, m, d, h=0, minute=0, second=0):
+                  return datetime(y, m, d, h, minute, second, tzinfo=zone)
+              leap = schedule("0 0 29 2 *", tz)
+              cases = [
+                  ("before-surrogate", dt(2028,2,27,12), dt(2028,2,29), dt(2024,2,29), dt(2028,2,29), dt(2024,2,29)),
+                  ("surrogate-exact", dt(2028,2,28), dt(2028,2,29), dt(2024,2,29), dt(2028,2,29), dt(2028,2,29)),
+                  ("day-before-noon", dt(2028,2,28,12), dt(2028,2,29), dt(2024,2,29), dt(2032,2,29), dt(2028,2,29)),
+                  ("second-before", dt(2028,2,28,23,59,59), dt(2028,2,29), dt(2024,2,29), dt(2032,2,29), dt(2028,2,29)),
+                  ("tick-exact-inclusive", dt(2028,2,29), dt(2028,2,29), dt(2028,2,29), dt(2032,2,29), dt(2028,2,29)),
+                  ("second-after", dt(2028,2,29,0,0,1), dt(2032,2,29), dt(2028,2,29), dt(2032,2,29), dt(2028,2,29)),
+                  ("nonleap-control", dt(2027,2,28,12), dt(2028,2,29), dt(2024,2,29), dt(2028,2,29), dt(2024,2,29)),
+              ]
+              for label, query, forward, reverse, bf, br in cases:
+                  for ascending, correct, before in ((True,forward,bf),(False,reverse,br)):
+                      actual = next(leap.execution_time_iterator(query.timestamp(), ascending=ascending))
+                      record("RemoteSchedule", label + (" forward" if ascending else " reverse"), tz, [actual], [correct], [before])
+              query = dt(2028,2,28,12)
+              union = schedule(["0 0 29 2 *", "0 0 1 3 *"], tz)
+              for ascending, correct, before in (
+                  (True, [dt(2028,2,29),dt(2028,3,1),dt(2029,3,1)], [dt(2028,3,1),dt(2029,3,1),dt(2030,3,1)]),
+                  (False, [dt(2027,3,1),dt(2026,3,1),dt(2025,3,1)], [dt(2028,2,29),dt(2027,3,1),dt(2026,3,1)]),
+              ):
+                  actual = list(islice(union.execution_time_iterator(query.timestamp(), ascending=ascending), 3))
+                  record("RemoteSchedule", "union forward" if ascending else "union reverse", tz, actual, correct, before)
+              ordinary = schedule("0 0 28 2 *", tz)
+              for ascending, expected in ((True,dt(2029,2,28)),(False,dt(2028,2,28))):
+                  actual = next(ordinary.execution_time_iterator(query.timestamp(), ascending=ascending))
+                  record("RemoteSchedule", "ordinary forward" if ascending else "ordinary reverse", tz, [actual], [expected], [expected])
+              partitions = TimeWindowPartitionsDefinition(start="2020-02-29", fmt="%Y-%m-%d", cron_schedule="0 0 29 2 *", timezone=tz)
+              for label, query, end_closed, correct, before in (
+                  ("before-surrogate",dt(2028,2,27,12),False,"2024-02-29","2024-02-29"),
+                  ("day-before-noon",dt(2028,2,28,12),False,"2024-02-29","2028-02-29"),
+                  ("tick-exact",dt(2028,2,29),False,"2028-02-29","2028-02-29"),
+                  ("second-after",dt(2028,2,29,0,0,1),False,"2028-02-29","2028-02-29"),
+                  ("nonleap",dt(2027,2,28,12),False,"2024-02-29","2024-02-29"),
+                  ("end-closed-exact",dt(2028,2,29),True,"2024-02-29","2024-02-29"),
+                  ("end-closed-day-before",dt(2028,2,28,12),True,"2024-02-29","2028-02-29"),
+              ):
+                  actual = partitions.get_partition_key_for_timestamp(query.timestamp(), end_closed=end_closed)
+                  record("TimeWindowPartitionsDefinition", label, tz, [actual], [correct], [before])
+          report = dict(purpose="BEFORE diagnostic: exit zero means defects reproduced, NOT product passing", source_head=git("rev-parse","HEAD"), source_tree=git("rev-parse","HEAD^{tree}"), module_paths=paths, python=sys.version, platform=platform.platform(), distributions=sorted(f"{d.metadata['Name']}=={d.version}" for d in md.distributions()), cases=len(rows), known_bug_cases=sum(r["known_bug_case"] for r in rows), unexpected=sum(not r["baseline_expectation_met"] for r in rows), observations=rows)
+          print("DIAGNOSTIC_JSON=" + json.dumps(report, sort_keys=True), flush=True)
+          assert report["unexpected"] == 0 and report["known_bug_cases"] > 0, "Baseline differs: inspect evidence, do not call product green"
+          PY
